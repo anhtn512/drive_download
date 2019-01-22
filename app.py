@@ -3,9 +3,8 @@ from googleapiclient.discovery import build
 from oauth2client import file, client, tools
 from apiclient.http import MediaIoBaseDownload
 from apiclient import errors
+from multiprocessing import Pool
 import io
-import time
-import sys
 
 mimedict = {
     'csv': 'text/csv',
@@ -29,21 +28,21 @@ mimedict = {
     'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
 }
 
-queue_file = []
-speed = 3
-drive_id = '14Ta-rCJNscUCfWKe5_1LLUMQEpxLHSOV'
-
 # If modifying these scopes, delete the file token.pickle.
 SCOPES = ['https://www.googleapis.com/auth/drive']
 
+queue_file = []
+speed = 5
+drive_id = '14Ta-rCJNscUCfWKe5_1LLUMQEpxLHSOV'
+
 def download_folder(service, folder_id, location, folder_name):
+    global queue_file
     path = location + folder_name + '/'
     os.mkdir(path)
     files = service.files().list(
         q="'{}' in parents".format(folder_id),
         fields='files(id, name, mimeType, size)').execute()
     items = files.get('files', [])
-
     for item in items:
         if item['mimeType'] == 'application/vnd.google-apps.folder':
             download_folder(service, item['id'], path, item['name'])
@@ -54,6 +53,10 @@ def download_folder(service, folder_id, location, folder_name):
                 'mimeType': item['mimeType'],
                 'location': path
             }
+            try:
+                temp['size'] = item['size']
+            except:
+                temp['size'] = '2000000'
             queue_file.append(temp)
 
 def download_file_single(service, file_id, mimetype, location, file_name):
@@ -65,8 +68,7 @@ def download_file_single(service, file_id, mimetype, location, file_name):
         test_path = location + file_name + '(' + str(count_duplicate) + ')'
     if count_duplicate != 0:
         file_name = file_name + '(' + str(count_duplicate) + ')'
-    sys.stdout.write("\rDownload {}".format(file_name))
-    sys.stdout.flush()
+    print('Downloading file {} ...'.format(file_name))
     if 'google-apps' in mimetype:
         try:
             ext = file_name.split('.')[-1]
@@ -75,78 +77,101 @@ def download_file_single(service, file_id, mimetype, location, file_name):
                 mimeType = mimedict[ext]
             request = service.files().export_media(fileId=file_id, mimeType=mimeType)
             fh = io.FileIO('{}{}'.format(location, file_name), 'wb')
-            downloader = MediaIoBaseDownload(fh, request)
+            downloader = MediaIoBaseDownload(fh, request, chunksize=1024*1024)
             done = False
             while done is False:
                 status, done = downloader.next_chunk()
-                sys.stdout.write("\rDownload {} with {}%".format(file_name, int(status.progress() * 100)))
-                sys.stdout.flush()
         except errors.HttpError as e:
-            sys.stdout.write('\rDownload {} fail\n'.format(file_name))
-            print(e)
+            print('Downloading file {} fail, Check error: {}'.format(file_name, e))
             return False
     else:
         try:
             request = service.files().get_media(fileId=file_id)
             fh = io.FileIO('{}{}'.format(location, file_name), 'wb')
-            downloader = MediaIoBaseDownload(fh, request), chunksize=1024*1024)
+            downloader = MediaIoBaseDownload(fh, request, chunksize=1024*1024)
             done = False
             while done is False:
                 status, done = downloader.next_chunk()
-                sys.stdout.write("\rDownload {} with {}%".format(file_name, int(status.progress() * 100)))
-                sys.stdout.flush()
         except errors.HttpError as e:
-            sys.stdout.write('\rDownload {} fail\n'.format(file_name))
-            print('Check error: ', e)
+            print('Downloading file {} fail, Check error: {}'.format(file_name, e))
             return False
-    sys.stdout.write(' success\n')
+    print('Download file {} success.'.format(file_name))
     return True
 
-def download_file(service, queue_file):
-    pass
+def balance_files(array_file, speed=5):
+    files = sorted(array_file, key=lambda x: int(x['size']), reverse=True)
+    # print(sum(map(lambda x: int(x['size']), files)))
+    split_array = lambda A, n=5: [A[i:i + n] for i in range(0, len(A), n)]
+    queue_raw = split_array(files, speed)
+    for i in queue_raw[1::2]: i.sort(key=lambda x: int(x['size']))
+    queue = []
+    for i in range(speed):
+        temp = []
+        for j in queue_raw:
+            if len(j) > i:
+                temp.append(j[i])
+        queue.append(temp)
+    # for i in queue:
+    #     print(sum(map(lambda x: int(x['size']), i)))
+    return queue
 
-creds = None
-store = file.Storage('token.json')
-creds = store.get()
-if not creds or creds.invalid:
-    flow = client.flow_from_clientsecrets('credentials.json', SCOPES)
-    creds = tools.run_flow(flow, store)
+def download_file(attemp):
+    service, files = attemp
+    for i in files:
+        download_file_single(service, i['id'], i['mimeType'], i['location'], i['name'])
 
-service = build('drive', 'v3', credentials=creds)
+def main():
+    creds = None
+    store = file.Storage('token.json')
+    creds = store.get()
+    if not creds or creds.invalid:
+        flow = client.flow_from_clientsecrets('credentials.json', SCOPES)
+        creds = tools.run_flow(flow, store)
 
-pwd = os.path.dirname(os.path.abspath(__file__))
-location = pwd + '/download/'
-if not os.path.isdir(location):
-    os.mkdir(location)
+    service = build('drive', 'v3', credentials=creds)
 
-objects = service.files().get(fileId='{}'.format(drive_id), fields="name, mimeType").execute()
-if objects['mimeType'] == 'application/vnd.google-apps.folder':
-    folder_name = objects['name']
-    # Check folder existed
-    test_path = location + folder_name + '/'
-    count_duplicate = 0
-    while os.path.isdir(test_path):
-        count_duplicate += 1
-        test_path = location + folder_name + '(' + str(count_duplicate) + ')/'
-    if count_duplicate != 0:
-        folder_name = objects['name'] + '(' + str(count_duplicate) + ')'
+    pwd = os.path.dirname(os.path.abspath(__file__))
+    location = pwd + '/download/'
+    if not os.path.isdir(location):
+        os.mkdir(location)
 
-    download_folder(service, drive_id, location, folder_name)
-else:
-    file_name = objects['name']
-    # Check file existed
-    test_path = location + file_name
-    count_duplicate = 0
-    while os.path.isfile(test_path):
-        count_duplicate += 1
-        test_path = location + file_name + '(' + str(count_duplicate) + ')'
-    file_name = objects['name'] + '(' + str(count_duplicate) + ')'
-    temp = {
-        'id': drive_id,
-        'name': file_name,
-        'location': location
-    }
-    queue_file.append(temp)
-print(queue_file)
-for item in queue_file:
-    download_file_single(service, item['id'], item['mimeType'], item['location'], item['name'])
+    objects = service.files().get(fileId='{}'.format(drive_id), fields="name, mimeType").execute()
+    if objects['mimeType'] == 'application/vnd.google-apps.folder':
+        folder_name = objects['name']
+        # Check folder existed
+        test_path = location + folder_name + '/'
+        count_duplicate = 0
+        while os.path.isdir(test_path):
+            count_duplicate += 1
+            test_path = location + folder_name + '(' + str(count_duplicate) + ')/'
+        if count_duplicate != 0:
+            folder_name = objects['name'] + '(' + str(count_duplicate) + ')'
+        download_folder(service, drive_id, location, folder_name)
+    # else:
+    #     file_name = objects['name']
+    #     test_path = location + file_name
+    #     count_duplicate = 0
+    #     while os.path.isfile(test_path):
+    #         count_duplicate += 1
+    #         test_path = location + file_name + '(' + str(count_duplicate) + ')'
+    #     file_name = objects['name'] + '(' + str(count_duplicate) + ')'
+    #     temp = {
+    #         'id': drive_id,
+    #         'name': file_name,
+    #         'location': location
+    #     }
+    #     queue_file.append(temp)
+    global queue_file
+    queue_file = balance_files(queue_file, speed)
+    print(queue_file)
+    queue = []
+    for i in queue_file: queue.append(tuple([service, i]))
+    print(queue)
+    pool = Pool(speed)
+    result = pool.map(download_file, queue)
+    pool.close()
+    pool.join()
+
+
+if __name__ == "__main__":
+    main()
